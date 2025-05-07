@@ -1,0 +1,147 @@
+import numpy as np
+import xarray as xr
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+plt.close('all')
+
+# Load the dataset
+ds = OMFIT['CLASS_DATABASE']
+
+# Convert the dataset to a DataFrame
+df = pd.DataFrame(ds)
+
+# Replace infinite values with NaN
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+# Add an index column to keep track of original row numbers
+df['original_index'] = df.index
+
+# Identify rows with NaN values
+nan_rows = df[df.isna().any(axis=1)]
+print("Rows with NaN values:\n", nan_rows)
+
+# Identify columns with NaN values
+nan_columns = df.isna().sum()
+nan_columns = nan_columns[nan_columns > 0]
+print("Columns with NaN values:\n", nan_columns)
+
+# Specify the columns to check for NaN values
+columns_to_check = [col for col in df.columns if col not in ['shot', 'state']]
+
+nan_details = {}
+for feature in columns_to_check:
+    if df[feature].isna().sum() > 0:
+        nan_subset = df[df[feature].isna()][['shot', 'time']]
+        nan_details[feature] = nan_subset.groupby('shot')['time'].apply(list).to_dict()
+
+for feature, details in nan_details.items():
+    print(f"\nFeature '{feature}' has NaN values in the following shots and times:")
+    for shot, times in details.items():
+        print(f"Shot: {shot}, Times: {times}")
+
+# Selected features
+selected_features = ['iln3iamp', 'iln2iamp', 'iun2iamp', 'iun3iamp',
+                     'iln3iphase', 'iln2iphase', 'iun2iphase', 'iun3iphase',
+                     'betan', 'dR_sep', 'density', 'n_eped', 'li', 'tritop']
+plot_features = ['n_eped', 'iln3iamp']
+
+# Clean the dataframe
+df_cleaned = df.dropna(subset=selected_features, how='any')
+df_cleaned = df_cleaned[df_cleaned['n'] == 3]
+
+print(f"Original DataFrame shape: {df.shape}")
+print(f"Cleaned DataFrame shape: {df_cleaned.shape}")
+
+# Inputs and Targets
+X = df_cleaned[selected_features]
+y = df_cleaned['state']
+
+# Split the data
+X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(X, y, df_cleaned['original_index'], test_size=0.2, random_state=42)
+OMFIT['X_test'] = X_test.copy()
+
+# Train Random Forest
+clf = RandomForestClassifier(n_estimators=100, random_state=42)
+clf.fit(X_train, y_train)
+
+# Predict
+y_pred = clf.predict(X_test)
+
+# Load Manual Test Set
+df_manual = pd.DataFrame(OMFIT['TEST_CLASS_DATABASE'])
+
+# Clean Test Set
+df_manual.replace([np.inf, -np.inf], np.nan, inplace=True)
+df_manual = df_manual.dropna(subset=selected_features, how='any')
+df_manual = df_manual[df_manual['n'] == 3]
+test_X = df_manual[selected_features]
+test_y = df_manual['state']
+test_y_pred = clf.predict(test_X)
+
+# Add predictions
+df_manual['actual_state'] = test_y
+df_manual['predicted_state'] = test_y_pred
+
+# Plot test shots
+shots_ = df_manual['shot'].unique()
+
+for shot in shots_:
+    shot_data = df_manual[df_manual['shot'] == shot]
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(shot_data['time'], shot_data['actual_state'], 'g.-', label='Actual State')
+    plt.plot(shot_data['time'], shot_data['predicted_state'], 'r.-', label='Predicted State')
+
+    plt.xlabel('Time')
+    plt.ylabel('Suppression State')
+    plt.title(f'Test Shot {shot} State Comparison')
+    plt.legend()
+    plt.show()
+
+# Overall Accuracy
+accuracy = accuracy_score(y_test, y_pred)
+print(f"Accuracy: {accuracy:.2f}")
+
+# Confusion Matrix
+state_labels = ['ELMing', 'Suppressed', 'Dithering', 'Mitigated', 'N/A']
+
+plt.figure()
+cm = confusion_matrix(y_test, y_pred, labels=state_labels)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=state_labels,
+            yticklabels=state_labels)
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix (ELMing/Suppressed/Dithering/Mitigated)')
+plt.show()
+
+# Classification Report
+print(classification_report(y_test, y_pred, target_names=state_labels))
+
+# Prepare for Plotting
+df_test = X_test.copy()
+df_test['actual_state'] = y_test
+df_test['predicted_state'] = y_pred
+
+# Merge back plotting features
+for feature in plot_features:
+    if feature not in df_test.columns:
+        df_test[feature] = df.loc[df_test.index, feature]
+
+# Plotting categories
+df_test['comparison'] = np.where(df_test['actual_state'] == df_test['predicted_state'], 'Correct', 'Incorrect')
+
+# Plot
+g = sns.jointplot(data=df_test, x=plot_features[0], y=plot_features[1], hue='comparison',
+                  palette={'Correct': 'green', 'Incorrect': 'red'},
+                  marginal_kws=dict(common_norm=False))
+g.fig.suptitle('Correct vs Incorrect Classification')
+
+# Add shot and time if needed
+df_test['shot'] = df.loc[idx_test, 'shot']
+# df_test['time'] = df.loc[idx_test, 'time']  # Uncomment if you need time info
