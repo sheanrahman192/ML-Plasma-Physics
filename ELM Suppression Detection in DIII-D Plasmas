@@ -1,0 +1,676 @@
+# detect ELMing and ELM suppressed cases
+
+import random
+import xarray as xr
+from scipy.ndimage.filters import maximum_filter1d
+import time
+import matplotlib.backends  # .backend_pdf import PdfPages
+import matplotlib.backends.backend_pdf  # import PdfPages
+
+
+def fetch_and_slice_signal(shot, signal_name):
+    try:
+        signal = OMFITmdsValue(server='DIII-D', shot = shot, TDI = signal_name).xarray()
+        max_time = min(signal.coords['dim_0'].max().item(), 6000)
+        signal = signal.sel(dim_0 = slice(0, max_time))
+        print(f'Successfully fetch and sliced signal {signal_name}')
+        return signal
+
+    except Exception as e:
+        print(f'Unable to fetch or slice {signal_name} for shot {shot}: {e}.')
+        return None
+
+def filter_shot(betan, iln3iamp, iun3iamp, iln2iamp, iun2iamp, shot):
+    try:
+        iln3iamp_resampled = iln3iamp.interp(dim_0 = betan.dim_0[(betan>1)])
+        iun3iamp_resampled = iun3iamp.interp(dim_0 = betan.dim_0[(betan>1)])
+        iln2iamp_resampled = iln2iamp.interp(dim_0 = betan.dim_0[(betan>1)])
+        iun2iamp_resampled = iun2iamp.interp(dim_0 = betan.dim_0[(betan>1)])
+        currents_sum = iln3iamp_resampled+iun3iamp_resampled+iln2iamp_resampled+iun2iamp_resampled
+##        sample_indices = random.sample(range(len(currents_sum)), int(0.2 * len(currents_sum)))
+##        sampled_sum = currents_sum.isel(dim_0=sample_indices)
+        if (currents_sum >= 1000).sum() / len(currents_sum) < 0.6:
+            return False, currents_sum
+        return True, currents_sum
+    except Exception as e:
+        print(f'Error in filtering shot {shot}: {e}.')
+        return False, currents_sum
+
+def extract_betan_times(betan, ip, shot):
+    try:
+        ip_resampled = ip.interp(dim_0 = betan.dim_0)
+        valid_times = betan.dim_0[(betan>1) & (ip_resampled > 0.4 * 10**6)]
+        valid_times = valid_times[(valid_times > betan.dim_0.min()) & (valid_times < betan.dim_0.max() - 160)]
+        return valid_times
+    except Exception as e:
+        print(f'Error in extracting times for shot {shot}: {e}.')
+        return xr.DataArray([])
+
+def sliding_window_maximum(betan_times, fs03, window_size, shot):
+    max_values = []
+    half_window = window_size / 2
+    try:
+        for time in betan_times:
+            start_time = time - half_window
+            end_time = time + half_window
+            if start_time >= fs03.dim_0.min().item() and end_time <= fs03.dim_0.max().item():
+                window_data = fs03.sel(dim_0 = slice(start_time,end_time))
+                max_values.append(window_data.max().item())
+            else:
+                max_values.append(np.nan)
+
+    except Exception as e:
+        print(f'Error in sliding window maximum for shot {shot}: {e}.')
+
+    return max_values
+
+def normalize_fs03(fs03, betan_times, shot):
+    try:
+        fs03_at_betan_times = fs03.interp(dim_0=betan_times, method='linear').sel(dim_0=betan_times)
+        fs03_no_outliers = fs03_at_betan_times.where(fs03_at_betan_times < 10 * fs03_at_betan_times.median(), drop = True)
+        median_fs03 = fs03_no_outliers.median().item()
+        return fs03_no_outliers, median_fs03
+    except Exception as e:
+        print(f'Error in normalizing fs03 for shot {shot}: {e}.')
+        return None, np.nan
+
+def find_first_index_meeting_condition(data_array, condition_array, start_index):
+    result = data_array.sel(dim_0=slice(None, start_index)).where(condition_array, drop=False)
+    reversed_indices = result.dim_0.values[::-1]
+    for idx in reversed_indices:
+        if not np.isnan(result.sel(dim_0=idx).values):
+            return idx
+    return None
+
+def find_first_index_meeting_condition_special(data_array, start_index):
+    result = data_array.sel(dim_0=slice(None, start_index))
+    reversed_indices = result.dim_0.values[::-1]
+    previous_value = None
+    num = 0
+    for idx in reversed_indices:
+        current_value = result.sel(dim_0=idx).values
+        print(current_value)
+        if previous_value is not None:
+            if current_value<5 and previous_value > 0:
+                print(f'previous value: {previous_value}')
+                return idx
+            if (current_value > 1.5 * previous_value) and previous_value > 0:
+                if num != 3:
+                    num+=1
+                    previous_value = current_value
+                    continue
+                else:
+                    print(f'previous value: {previous_value}')
+                    return idx
+            num = 0
+        previous_value = current_value
+    return None
+
+def find_rmp_thresholds(betan_times, normalized_max_values, normalized_fs03, iln3iamp, density, betan, shot, threshold=1.0):
+    rmp_thresholds = []
+    i = 0
+    found_first = False
+    found_elms = False
+    finish = False
+    have_found_elms = False
+    potential_elms = False
+    try:
+        normalized_max_values_da = xr.DataArray(normalized_max_values, coords={'dim_0':betan_times}, dims = 'dim_0')
+        excluded_times = []
+        while i < len(betan_times) - 1 and not finish:
+            if found_first == True:
+                time = betan_times[i].item()
+                window_start = time-100
+                window_end = time+100
+                if window_start < betan.dim_0.min().item():
+                    window_start = betan.dim_0.min().item()
+                if window_end > betan.dim_0.max().item():
+                    window_end = betan.dim_0.max().item()
+                iln3iamp_slope_i = iln3iamp.sel(dim_0 = slice(window_start, window_end)).diff('dim_0').mean()
+            if found_elms == True or (2 * normalized_max_values[i] < normalized_max_values[i+1] and (found_first == False or (iln3iamp_slope_i < 0 and found_first == True))):
+                print(f'ELMs? time: {betan_times[i].item()}') if found_elms == False else None
+                within_100ms = (betan_times > betan_times[i]) & (betan_times <= betan_times[i]+ 160)
+                potential_elms = True
+##                print(normalized_max_values[within_100ms])
+##                print(normalized_max_values[i])
+                if (normalized_max_values[within_100ms] > 2 * normalized_max_values[i]).sum()>6 or found_elms == True:
+                    print(f'ELMs! time: {betan_times[i].item()}') if found_elms == False else None
+                    found_elms = True
+                    have_found_elms = True
+                    for j in range(i+1, len(betan_times)-8):
+                        time = betan_times[j].item()
+                        print(normalized_max_values[j])
+                        if (normalized_max_values[j] < threshold * normalized_max_values[j-1] or (all(normalized_max_values[j] == normalized_max_values[j-4:j]) and normalized_max_values[j]<4)) and normalized_max_values[j] < 2.3:
+                            print(f'Threshold? time: {betan_times[j].item()}')
+                            within_50ms = (betan_times > betan_times[j]) & (betan_times <= betan_times[j]+ 160)
+                            higher_peaks_condition = (normalized_max_values[within_50ms] > 1.1*normalized_max_values[j]).sum() >= 2 and sum(1 for elem in normalized_max_values[within_50ms][-3:] if elem in normalized_max_values[within_50ms][normalized_max_values[within_50ms] > 1.1 * normalized_max_values[j]]) >= 2 and 2.5 * min(normalized_max_values[within_50ms][:3])>min(normalized_max_values[within_50ms][-5:]) and not all(abs(normalized_max_values[j-3:j] - normalized_max_values[j])/normalized_max_values[j]<0.05)
+                            lower_peaks_condition = (((normalized_max_values[within_50ms] < 0.85* normalized_max_values[j]) &
+                                                     (normalized_max_values[within_50ms] > 0.2 * normalized_max_values[j])).sum() / within_50ms.sum() >= 0.5) & (any(normalized_max_values_da.sel(dim_0 = slice(time, time+100)).diff('dim_0')>0.03))
+                            print(normalized_max_values[within_50ms])
+
+                            if all(normalized_max_values[within_50ms]==normalized_max_values[within_50ms][0]):
+                                print(f'All values in the sliding window maximum are the same. Cannot determine threshold.')
+                                if j == len(betan_times) - 9:
+                                    finish = True
+                                excluded_times.append(time)
+                                continue
+
+                            if higher_peaks_condition and normalized_max_values[j]>normalized_max_values[j-1]/4:
+                                print(f'Higher peaks exist in the next window! time: {betan_times[j].item()}')
+                                if j == len(betan_times) - 9:
+                                    finish = True
+                                excluded_times.append(time)
+                                continue
+
+                            if  (lower_peaks_condition or (all(normalized_max_values[within_50ms] <= normalized_max_values[j]) and ((normalized_max_values[within_50ms][-1] < 0.85 * normalized_max_values[j]) or ((normalized_max_values[j]-normalized_max_values[within_50ms]> 0.3) & (normalized_max_values[j]-normalized_max_values[within_50ms]< 2)).sum()>2))):
+                                print(f'Potential lower peaks exist in the next window! time: {betan_times[j].item()}')
+                                if j == len(betan_times) - 9:
+                                    finish = True
+                                excluded_times.append(time)
+                                continue
+
+                            if all(normalized_fs03.sel(dim_0 = slice(max(time-200,betan_times[0].item()),time-40)).values<normalized_max_values[j]):
+                                print(f'No big ELMs precede this time.')
+                                excluded_times.append(time)
+                                continue
+
+                            window_start = time-100
+                            window_end = time+100
+                            if window_start < betan.dim_0.min().item():
+                                window_start = betan.dim_0.min().item()
+                            if window_end > betan.dim_0.max().item():
+                                window_end = betan.dim_0.max().item()
+                            iln3iamp_slope = iln3iamp.sel(dim_0 = slice(window_start, window_end)).diff('dim_0').mean()
+                            density_slope = density.sel(dim_0 = slice(window_start, window_end)).diff('dim_0').mean()
+                            betan_slope = betan.sel(dim_0 = slice(window_start, window_end)).diff('dim_0').mean()
+                            print(f'iln3iamp_slope: {iln3iamp_slope.item()}')
+                            print(f'density_slope: {density_slope.item()}')
+                            print(f'betan_slope: {betan_slope.item()}')
+##                            print(max(iln3iamp.sel(dim_0 = slice(window_start, window_end))) - min(iln3iamp.sel(dim_0 = slice(window_start, window_end))))
+##                            print(0.08 * min(iln3iamp.sel(dim_0 = slice(window_start, window_end))))
+                            iln3iamp_resampled = iln3iamp.interp(dim_0 = betan_times).sel(dim_0 = betan_times).sel(dim_0 = slice(window_start, window_end))
+                            iln3iamp_resampled_slope = iln3iamp_resampled.diff('dim_0')
+                            print(iln3iamp_resampled_slope)
+##                            plot(range(1,11),iln3iamp_resampled_slope)
+                            current_ramp_condition = (iln3iamp_resampled_slope[:7] > 5).sum()> 5
+##                            print((iln3iamp_resampled_slope > 5).sum())
+##                            print(f"betan slope 60ms ago: {betan.sel(dim_0 = slice(window_start-60, window_end-60)).diff('dim_0').mean().item()}")
+##                            print(f"density slope 60ms ago: {density.sel(dim_0 = slice(window_start-60, window_end-60)).diff('dim_0').mean().item()}")
+                            if iln3iamp_slope >= 0.5 and ((density_slope < -10**10 and current_ramp_condition and betan_slope < -0.005) or ((iln3iamp_resampled_slope[:5] > 5).sum().item()>1 and (iln3iamp_resampled_slope[-4:] > 5).sum().item()<2 and (betan.sel(dim_0 = slice(window_start-60, window_end-60)).diff('dim_0').mean()< -0.005 or density.sel(dim_0 = slice(window_start-60, window_end-60)).diff('dim_0').mean() < -10**10))):
+                                if (iln3iamp_resampled_slope[:5] > 5).sum().item()>1 and (iln3iamp_resampled_slope[-4:] > 5).sum().item()<2 and (betan.sel(dim_0 = slice(window_start-60, window_end-60)).diff('dim_0').mean()< -0.005 or density.sel(dim_0 = slice(window_start-60, window_end-60)).diff('dim_0').mean() < -10**10):
+                                    da = iln3iamp.interp(dim_0 = betan_times).diff('dim_0')
+                                    condition = da > 5
+                                    slope_end_time = find_first_index_meeting_condition(da, condition, time-20)
+##                                    print(f'slope end time: {slope_end_time}')
+                                    if slope_end_time is not None and time-slope_end_time < 120:
+                                        slope_start_time = find_first_index_meeting_condition_special(da, slope_end_time)
+##                                        print(f'slope start time:{slope_start_time}') if slope_start_time is not None else None
+                                        if slope_start_time is not None and slope_end_time-slope_start_time>60:
+                                            values_on_slope = iln3iamp.interp(dim_0 = betan_times).sel(dim_0 = slice(slope_start_time, slope_end_time)).values
+##                                            print(slope_start_time)
+##                                            print(slope_end_time)
+##                                            print(max(values_on_slope))
+##                                            print(min(values_on_slope))
+
+                                            start_peak = normalized_max_values_da.sel(dim_0 = slope_start_time, method = 'nearest').values
+                                            start_time = normalized_max_values_da.sel(dim_0 = slope_start_time, method = 'nearest').dim_0.values
+##                                            print(f'Its nearest betan point: {start_time}')
+##                                            for t, val in zip(normalized_fs03.sel(dim_0 = slice(max(slope_start_time-200,betan_times[0].item()),slope_start_time-20))['dim_0'].values, normalized_fs03.sel(dim_0 = slice(max(slope_start_time-200,betan_times[0].item()),slope_start_time-20)).values):
+##                                                if val > start_peak:
+##                                                    print(f'At time {t}, fs03 value = {val}, larger than the value when the slope starts: {start_peak}')
+                                            if all(normalized_fs03.sel(dim_0 = slice(max(slope_start_time-200,betan_times[0].item()),slope_start_time-20)).values<=start_peak):
+                                                print(f'No big ELMs precede this time.')
+                                                continue
+
+                                            if max(values_on_slope) <= 1.35* min(values_on_slope) and all(da.sel(dim_0 = slice(slope_start_time+20, slope_end_time+10)).values > 5):
+                                                print(f'Threshold found on staircase! time: {time}')
+                                                rmp_thresholds.append(time-60)
+                                                i = j
+                                                found_first = True
+                                                found_elms = False
+                                                break
+                                    print(f'Staircase was found, but restrictions were not met. time: {time}')
+                                else:
+                                    print(f'Threshold! time: {betan_times[j].item()}')
+                                    rmp_thresholds.append(time)
+                                    i = j
+                                    found_first = True
+                                    found_elms = False
+                                    break
+                            else:
+                                da = iln3iamp.interp(dim_0 = betan_times).diff('dim_0')
+                                condition = da > 5
+                                slope_end_time = find_first_index_meeting_condition(da, condition, time-20)
+                                if slope_end_time is not None and time-slope_end_time < 200 and all(iln3iamp_resampled_slope.values[:5] < 5):
+                                    slope_start_time = find_first_index_meeting_condition_special(da, slope_end_time-40)
+                                    iln3iamp_slope = iln3iamp.sel(dim_0 = slice(window_start-200, window_end-200)).diff('dim_0').mean()
+                                    density_slope = density.sel(dim_0 = slice(window_start-200, window_end-200)).diff('dim_0').mean()
+                                    betan_slope = betan.sel(dim_0 = slice(window_start-200, window_end-200)).diff('dim_0').mean()
+##                                    print(f'new iln3iamp_slope: {iln3iamp_slope.item()}')
+##                                    print(f'new density_slope: {density_slope.item()}')
+##                                    print(f'new betan_slope: {betan_slope.item()}')
+                                    if slope_start_time is not None and slope_end_time-slope_start_time>60 and iln3iamp_slope >= 0.5 and density_slope < -10**10 and betan_slope < 0.005:
+                                        values_on_slope = iln3iamp.interp(dim_0 = betan_times).sel(dim_0 = slice(slope_start_time, slope_end_time)).values
+##                                        print(f'slope ends at: {slope_end_time}')
+##                                        print(f'slope starts at: {slope_start_time}')
+
+                                        start_peak = normalized_max_values_da.sel(dim_0 = slope_start_time, method = 'nearest').values
+                                        start_time = normalized_max_values_da.sel(dim_0 = slope_start_time, method = 'nearest').dim_0.values
+##                                        print(f'its nearest betan point: {start_time}')
+##                                        for t, val in zip(normalized_fs03.sel(dim_0 = slice(max(slope_start_time-200,betan_times[0].item()),slope_start_time-20))['dim_0'].values, normalized_fs03.sel(dim_0 = slice(max(slope_start_time-200,betan_times[0].item()),slope_start_time-20)).values):
+##                                            if val > start_peak:
+##                                                print(f'At time {t}, fs03 value = {val}, larger than the value when the slope starts: {start_peak}')
+                                        if all(normalized_fs03.sel(dim_0 = slice(max(slope_start_time-200,betan_times[0].item()),slope_start_time-20)).values<start_peak):
+                                            print(f'No big ELMs precede this time.')
+                                            continue
+
+                                        if max(values_on_slope) <= 1.35* min(values_on_slope) and all(da.sel(dim_0 = slice(slope_start_time+20, slope_end_time+10)).values > 5):
+                                            print(f'Threshold found on staircase! time: {betan_times[j].item()}')
+                                            rmp_thresholds.append(time-200)
+                                            i = j
+                                            found_first = True
+                                            found_elms = False
+                                            break
+                                print(f'Conventional threshold restrictions on betan, iln3iamp, and density are not met. time: {betan_times[j].item()}')
+                                if slope_end_time is not None and all(iln3iamp_resampled_slope.values[:5] < 5):
+                                    excluded_times.append(time)
+                                    print(f'Staircase was found, but restrictions were not met. time: {time}')
+                                if j == len(betan_times) - 9:
+                                    print(f'No threshold found')
+                                    finish = True
+                        else:
+                            print(f'Not a threshold. time: time: {betan_times[j].item()}')
+                            if j == len(betan_times) - 9:
+                                print(f'No threshold found')
+                                finish = True
+            i += 1
+    except Exception as e:
+        print(f'Error in finding RMP thresholds for shot {shot}: {e}.')
+    return rmp_thresholds
+
+def process_shots_and_find_rmp_thresholds(shots):
+    rmp_times = {}
+    window_size = 100
+    for shot in shots:
+        try:
+            print('*'*80)
+            print(f'Now processing: shot {shot}.')
+            betan = fetch_and_slice_signal(shot, 'betan')
+            density = fetch_and_slice_signal(shot, 'density')
+            iln3iamp = fetch_and_slice_signal(shot, 'iln3iamp')
+            fs03 = fetch_and_slice_signal(shot, 'fs03')
+            if fs03 is None:
+                fs03 = fetch_and_slice_signal(shot, 'fs05')
+            ip = fetch_and_slice_signal(shot, 'ip')
+            iun3iamp = fetch_and_slice_signal(shot, 'iun3iamp')
+            if iun3iamp is None and iln3iamp:
+                iun3iamp = xr.zeros_like(iln3iamp)
+
+            iln2iamp = fetch_and_slice_signal(shot, 'iln2iamp')
+            if iln2iamp is None and iln3iamp:
+                iln2iamp = xr.zeros_like(iln3iamp)
+
+            iun2iamp = fetch_and_slice_signal(shot, 'iun2iamp')
+            if iun2iamp is None and iln3iamp:
+                iun2iamp = xr.zeros_like(iln3iamp)
+            signals = {'betan': betan, 'density': density, 'iln3iamp': iln3iamp, 'fs03': fs03,'ip': ip}
+            missing_signals = [name for name, signal in signals.items() if signal is None]
+            if missing_signals:
+                print(f'Signals {sig for sig in missing_signals} for shot {shot} are None.')
+                continue
+
+
+            if not filter_shot(betan, iln3iamp, iun3iamp, iln2iamp, iun2iamp, shot)[0]:
+                print(f'Sum of RMP coil currents is less than 1000 for shot {shot}.')
+                continue
+
+            betan_times = extract_betan_times(betan, ip, shot)
+            if len(betan_times) == 0:
+                print(f'No times in shot {shot} are valid.')
+                continue
+
+            max_values = sliding_window_maximum(betan_times, fs03, window_size, shot)
+            fs03_no_outliers, median_fs03 = normalize_fs03(fs03, betan_times, shot)
+            normalized_max_values = np.array(max_values) / median_fs03
+            normalized_fs03 = fs03/median_fs03
+
+            rmp_thresholds = find_rmp_thresholds(betan_times, normalized_max_values, normalized_fs03, iln3iamp, density, betan, shot)
+            print(f'RMP thresholds: {rmp_thresholds}.')
+            if rmp_thresholds:
+                rmp_times[shot] = rmp_thresholds
+        except Exception as e:
+            print(f'Error processing shot {shot}: {e}.')
+            continue
+    return rmp_times
+
+
+
+#shots = [175737, 179328, 179358, 179363]
+shots = [175737, 179328]
+
+# rundays = ['20220719', '20220830', '20220831A', '20220913']
+rundays = OMFIT['rmp_rundays']
+
+exclude_shots = [171167]
+window = 150
+make_plots = True
+use_dalpha = False
+use_freq = False
+savedir = '/fusion/projects/omfit-results/logannc/share/2024_elm_datase_building'
+betan_min = 1.0
+small_elm_factor = 0.1
+
+# this allows us to specify runday IDs instead of manually entering all the shot numbers
+def get_d3d_run_shots(rundays):
+    """Search the D3D relational database for shots corresponding to runs"""
+    shots = []
+    for runday in rundays:
+        q = OMFITrdb(query="select * from shots where run='{}'".format(runday), db='d3drdb', server='d3drdb', by_column=False)
+        run_shots = []
+        if len(q):
+            for k in q:
+                if q[k]['SHOT_TYPE'] == 'plasma':
+                    run_shots.append(q[k]['SHOT'])
+                    shots.append(q[k]['SHOT'])
+        if not len(shots):
+            printe('{:} D3DRDB is empty'.format(runday))
+        else:
+            printi('Run {:} included shots {:}'.format(runday, run_shots))
+    return shots
+
+
+shots = sorted(set(shots).union(get_d3d_run_shots(rundays)).difference(exclude_shots))
+
+
+
+
+
+
+# back up last one in case we accidentally ran this script
+# and didn't actually mean to overwrite it!
+OMFIT['THRESHOLD_DATABASE_BACKUP'] = OMFIT.get('THRESHOLD_DATABASE', {})
+# start a new database
+table = OMFIT['THRESHOLD_DATABASE'] = dict(shot=[], time=[], n=[], threshVar=[], type=[])
+
+
+
+# create a PdfPages object to save all plots
+# for quick flipping through afterwards
+if make_plots:
+    plt.close('all')  # clean up the existing plots to reduce clutter
+    timestr = time.strftime("%Y%m%d-%H")
+    pdf = matplotlib.backends.backend_pdf.PdfPages(f'{savedir}/threshold_database_plots_{timestr}.pdf')
+    pdfc = matplotlib.backends.backend_pdf.PdfPages(f'{savedir}/threshold_database_clean_plots_{timestr}.pdf')
+
+
+# loop through all the shots of interest
+print('Hunting for suppression in shots:')
+print(array(shots))
+for shot in shots:
+    try:
+        betan = OMFITmdsValue(server='DIII-D', TDI='betan', shot=shot).xarray()
+        density = OMFITmdsValue(server='DIII-D', TDI='density', shot=shot).xarray()
+    except ValueError:
+        continue  # if betan data doesn't exist it isn't a valid plasma shot
+    print(f' > {shot}')
+
+    # check for H-mode
+    betan = betan[betan > betan_min]
+    if len(betan) == 0:
+        continue  # no H-mode data in this shot
+    tgrid = betan['dim_0'].values[10:]  # ignore the first 200 ms when it is just getting into H-mode (to dynamic)
+    betan = betan.sel(dim_0=tgrid, method='nearest')
+    density = density.sel(dim_0=tgrid, method='nearest')
+
+    # check that RMP is on
+    try:
+        iun2 = OMFITmdsValue(server='DIII-D', TDI='iun2iamp', shot=shot).xarray()
+        iln2 = OMFITmdsValue(server='DIII-D', TDI='iln2iamp', shot=shot).xarray()
+        iun3 = OMFITmdsValue(server='DIII-D', TDI='iun3iamp', shot=shot).xarray()
+        iln3 = OMFITmdsValue(server='DIII-D', TDI='iln3iamp', shot=shot).xarray()
+        rmpn2 = (iun2 + iln2).interp(dim_0=tgrid)
+        rmpn3 = (iun3 + iln3).interp(dim_0=tgrid)
+        rmp = rmpn2 + rmpn3
+    except ValueError:
+        continue  # we need the rmp info to work!
+
+    # trim all other data to H-mode RMP times
+    ivalid = where((betan > 1) & (rmp > 1e3))[0]
+    tvalid = tgrid[ivalid]
+    if len(tvalid) == 0:
+        continue  # no H-mode RMP in this shot
+    tmin = tvalid[0]
+    tmax = tvalid[-1]
+
+    # option 1: use the d-alpha measurements directly
+    # this is relatively slow because it hands large, high frequency data
+    if use_dalpha:
+        elm = 0
+        for fskey in ['fs03', 'fs05']:
+            elm = elm + OMFITmdsValue(server='DIII-D', TDI=fskey, shot=shot).xarray()
+        elm = elm[elm['dim_0'] >= tmin]
+        elm = elm[elm['dim_0'] <= tmax]
+        elm = elm / np.percentile(elm.values, 95)  # normalized to large ELM values
+        # use a fast max smooth to turn sharp features into broad steps
+        x = elm['dim_0'].values
+        dx = (x[10] - x[0])/10  # faster than mean(diff(x))
+        sigma = int(window / dx)
+        hwidth = (sigma - 1) // 2
+        elm_smooth = maximum_filter1d(elm.values, sigma, mode='nearest', origin=-hwidth) # origin makes it causal
+        # TODO: add logic to find ELMing and suppressed times
+        tsup = []
+        telm = []
+
+    else:
+        # Use auto-detected ELM peaks
+        try:
+            elmp = OMFITmdsValue(server='DIII-D', TDI='ELMPMARKER', shot=shot).xarray()
+        except ValueError:
+            continue
+        # trim to H-mode
+        elmp = elmp[elmp['dim_0'] >= tmin]
+        elmp = elmp[elmp['dim_0'] <= tmax]
+
+        # if there are no ELMs during the whole time, then assume it is all suppressed
+        if len(elmp) == 0:
+            tsup = array([tmin])
+            telm = array([])
+        # otherwise, we need to find the start and end of suppression windows
+        else:
+            elmp = elmp / np.max(elmp)
+            elmp_original = 1.0 * elmp
+            # remove small ELMs
+            elmv = elmp[elmp>0].values
+            big = np.percentile(elmv, 90)  # avoid using any anomolously huge single spikes
+            small = small_elm_factor * big
+            valid = (elmp == 0) | (elmp > small)
+            elmp = elmp[valid]
+
+            # Option 1: robust suppression is where there are no ELMs for a long time
+            # note the 0s are still there from near the removed small elms
+            # we stack on tmax to capture cases where ELMs are suppressed until the end
+            x = hstack((elmp[elmp > 0]['dim_0'].values, [tmax]))
+            dx = np.diff(x)
+            isup = where(dx > window)[0]
+            ielm = isup + 1
+            # make this robust to 1 or a few ELMs in the middle of a long suppression period
+            if len(isup):
+                valid = hstack(([True], diff(isup) > 1))
+                isup = isup[valid]
+                valid = hstack((diff(ielm) > 1, [True]))
+                ielm = ielm[valid]
+                if ielm[-1] == len(x):
+                    ielm = ielm[:-1]
+            tsup = x[isup]
+            telm = x[ielm]
+            rmp_thresholds_time = None
+            if (len(telm) and len(tsup)) and tmax - telm[-1] < 100 and telm[-1] - tsup[-1] > 0.5 * (tmax-tmin):
+                # ELMPMARKER migh die, try filter scope script I wrote
+                print('ELMPMARKER dies')
+                rmp_thresholds_time = process_shots_and_find_rmp_thresholds([shot])
+                if len(rmp_thresholds_time):
+                    tsup = rmp_thresholds_time[shot]
+                    telm = [tsup[0]+window]
+                else:
+                    print('Did not find threshold using fs03/fs05. Shot is excluded')
+                    exclude_shots.append(shot)
+                    continue
+
+            # Option 2: Use the ELM frequency, smoothed and put onto the betan timebase
+            # I never got this to work well
+            if use_freq:
+                x = elmp[elmp > 0]['dim_0'].values
+                dx = np.diff(x)
+                # get elm spacing on regular betan time grid
+                dxg = interp1e(x[:-1], dx)(tgrid)
+                # use a maximum smooth to gloss over any minor ELM bursts in long periods of suppression
+                sigma = int(window / (tgrid[1] - tgrid[0]))
+                hwidth = (sigma - 1) // 2
+                dxm = maximum_filter1d(dxg, sigma, mode='nearest', origin=-hwidth)
+                freq = 1 / dxm[ivalid]
+                is_sup = freq < (1.0 / window)
+                isup = np.array([i for i in range(1, len(is_sup)) if not is_sup[i-1] and is_sup[i]]).astype(int)
+                ielm = np.array([i for i in range(1, len(is_sup)) if is_sup[i-1] and not is_sup[i]]).astype(int)
+                tsup = tvalid[isup]
+                telm = tvalid[ielm]
+                # use this to debug the ELM ID logic
+                if True:
+                    fig, axs = subplots(2, sharex=True)
+                    axs[0].plot(elmp_original['dim_0'].values[:-1], diff(elmp_original['dim_0'].values))
+                    axs[0].plot(x[:-1], dx)
+                    axs[1].axhline(1.0 / window, lw=1, c='k', ls='--')
+                    axs[1].plot(x[:-1], 1 / dx)
+                    axs[1].plot(tvalid, freq, marker='s')
+                    axs[1].plot(tvalid[is_sup], freq[is_sup], marker='o', ls='')
+
+
+    # check if it is "elm free" (uncontrolled density rise)
+    valid = []
+    tfre = []
+    if rmp_thresholds_time is None:
+        for ii, ti in enumerate(tsup):
+            dn = np.diff(density.sel(dim_0=[ti, ti + window], method='nearest'))[0]
+##            if not len(rmp.diff('dim_0').sel(dim_0=slice(tmin,ti)).values):
+##                continue # ti too close to tmin
+##            diamp = rmp.diff('dim_0').sel(dim_0=slice(tmin,ti)).sel(dim_0 = ti, method='nearest').values
+            if dn > 0.5e13 :
+                tfre.append(ti)
+##            elif diamp < -10 :
+##                tfre.append(ti)
+##            elif diamp < 10:
+##                slope = rmp.diff('dim_0')
+##                condition = slope > 10
+##                slope_end_time = find_first_index_meeting_condition(slope, condition, ti)
+##                if slope_end_time is not None:
+##                    condition = slope < 10
+##                    slope_start_time = find_first_index_meeting_condition(slope, condition, slope_end_time-40)
+##                    if slope_start_time is not None:
+##                        condition = slope > 10
+##                        potential_previous_rise_ends = find_first_index_meeting_condition(slope, condition, slope_start_time-20)
+##                        long_interval = (slope_start_time - potential_previous_rise_ends) > window if potential_previous_rise_ends is not None else True
+##                        if not long_interval:
+##                            condition = slope < 10
+##                            slope_start_time = find_first_index_meeting_condition(slope, condition, potential_previous_rise_ends)
+##                    values_on_slope = rmp.sel(dim_0=slice(slope_start_time, slope_end_time))
+##                    if rmp.diff('dim_0').sel(dim_0 = ti-window, method='nearest').values > 10 and max(values_on_slope) <= 1.35* min(values_on_slope):
+##                        valid.append(ii)
+##                    else:
+##                        tfre.append(ti)
+##                else:
+##                    tfre.append(ti)
+            else:
+                valid.append(ii)
+        valid = array(valid).astype(int)
+        tsup = tsup[valid]
+        telm = telm[valid]
+
+    # make a sorted list of the SUPP and ELMY times
+    typestr = ['SUPP'] * len(tsup) + ['ELMY'] * len(telm)
+    tall = hstack((tsup, telm))
+    if len(tall):
+        tall, typestr = zip(*sorted(zip(tall, typestr)))
+
+    # record results
+    is_good_shot = False
+    for itime, time in enumerate(tall):
+        table['shot'] = hstack((table['shot'], [shot])).astype(int)
+        table['time'] = hstack((table['time'], [int(time)])).astype(int)
+        table['type'] = hstack((table['type'], [typestr[itime]]))
+        # determine dominant toroidal mode number of RMP
+        n2 = rmpn2.sel(dim_0=[time], method='nearest')[0]
+        n3 = rmpn3.sel(dim_0=[time], method='nearest')[0]
+        if n2 >= n3:
+            nn = 2
+        else:
+            nn = 3
+        table['n'] = hstack((table['n'], [nn]))
+        # determine what changed to get suppression
+        dn = np.diff(density.sel(dim_0=[time-2*window, time], method='nearest'))[0]
+        di = np.diff(rmp.sel(dim_0=[time-2*window, time], method='nearest'))[0]
+        if time == tmin:
+            # we don't know the threshold if it was always suppressed
+            var = '?'
+        elif di > 1000:
+            # jump in RMP is too big -> do not know the "threshold"
+            var = '?'
+        elif di > 300:
+            var = 'RMP'
+        elif dn < -0.5e13:
+            var = 'neped'
+        else:
+            var = '?'
+        table['threshVar'] = hstack((table['threshVar'], [var]))
+        # mark this as a good shot if it has a threshold where we know what caused the suppression
+        if var != '?' and typestr[itime] == 'SUPP':
+            is_good_shot = True
+
+
+    if make_plots:
+        fig, ax = subplots()
+        betan.plot(marker='o', label=r'$\beta_N$')
+        (density / 3.5e13).plot(marker='o', label=r'Density / 3.5e13 [$m^{-3}$]')
+        (rmp / 5e3).plot(label='RMP / 5e3 [A]')
+        l, = elmp_original.plot(alpha=0.3) # so we can check small ELM removal
+        if len(elmp):
+            elmp.plot(label='ELM Marker', c=l.get_color())
+        for ti in tfre:
+            ax.axvline(ti, ls='--', color='firebrick')
+        for ti in tsup:
+            ax.axvline(ti, ls='--', color='grey')
+        for ti in telm:
+            ax.axvline(ti, ls='--', color='black')
+        if use_dalpha:
+            ax.plot(elm['dim_0'], elm_smooth, label='D-alpha Smoothed')
+        # make it look nice
+        ax.legend(text_same_color=True, hide_markers=True, title=f'{shot}')
+        ax.set_ylim(ymin=0)
+        ax.set_xlim(xmin=0)
+        fig.tight_layout()
+        # stop rendering the figures after 5 to save time
+        if fig.number >= 5:
+            plt.ioff()
+        # save all figures to a pdf for quick browsing later
+        pdf.savefig(fig)
+        if is_good_shot:
+            pdfc.savefig(fig)
+
+
+# close the pdf with all the figures if we made one
+if make_plots:
+    pdf.close()
+    pdfc.close()
+
+OMFIT['SHOTS_ELMPMARKER_DIES'] = exclude_shots
+
+# print the results!
+df = DataFrame(table)
+print(df)
+
+# we only really want the "threshold" if we know what was slowly changing to get us suppression
+# the ? cases include quick, large RMP steps that do not really represent a "threshold"
+df_clean = OMFIT['THRESHOLD_DATABASE_CLEAN'] = df[df['threshVar'] != '?']
+print(df_clean)
+
+# save the project - this script probably took a lot of time
+# we don't want to run it over night only to find iris was restarted in the morning and we lost the work
+OMFIT.save()
