@@ -1,0 +1,63 @@
+#Change to your shot number
+shot = 191673
+
+signal_names = ['iln3iamp', 'betan', 'fs04', 'density']
+
+
+table_data = OMFIT['my_labels']['data']
+
+ishot = where(table_data['Shot'] == shot)[0]
+
+'''
+For debugging help - 
+print(ishot)
+print(table_data['t_start'][ishot])
+print(table_data['t_end'][ishot])
+print(table_data['Label'][ishot])
+'''
+
+t_start = float(table_data['t_start'][ishot][0])
+t_end = float(table_data['t_end'][ishot][0])
+labels = table_data['Label'][ishot]
+
+
+iln3iamp = OMFITmdsValue(server='DIII-D', shot=shot, TDI=signal_names[0]).xarray()
+betan = OMFITmdsValue(server='DIII-D', shot=shot, TDI=signal_names[1]).xarray()
+fs04 = OMFITmdsValue(server='DIII-D', shot=shot, TDI=signal_names[2]).xarray()
+density = OMFITmdsValue(server='DIII-D', shot=shot, TDI=signal_names[3]).xarray()
+
+fig, axs = plt.subplots(4, 1, figsize=(8, 9), sharex=True)
+
+axs[0].set_title('My Data Suppression')
+axs[0].legend()
+
+for ilbl in ishot:
+    if table_data['Label'][ilbl] == 'Suppressed' or table_data['Label'][ilbl] == 'Dithering':
+        ColorLine = 'blue'
+    else:
+        ColorLine = 'red'
+
+    axs[0].axvline(table_data['t_start'][ilbl], label=table_data['Label'][ilbl], color = ColorLine)
+
+axs[0].axvline(table_data['t_end'][ishot][-1], color = 'black')
+axs[0].legend()
+
+wshot = where(OMFIT['wang_data']['shot'] == shot)[0]
+axs[0].plot(OMFIT['wang_data']['time'][wshot], OMFIT['wang_data']['suppressed'][wshot], marker='o', ls='-',color='green')
+
+
+axs[1].plot(betan['dim_0'], betan, label='Betan', color='green')
+axs[1].set_title('Betan')
+axs[1].legend()
+
+axs[2].plot(fs04['dim_0'], fs04, label='FS04', color='purple')
+axs[2].set_title('FS04')
+axs[2].legend()
+
+
+axs[3].plot(density['dim_0'], density, label='Density', color='orange')
+axs[3].set_title('Density')
+axs[3].legend()
+
+
+plt.tight_layout()
