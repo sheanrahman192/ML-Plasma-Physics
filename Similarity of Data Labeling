@@ -1,0 +1,100 @@
+# Shot number to analyze
+shot = 191673
+print(shot)
+
+# List of signals to consider (though not used directly in this script)
+signal_names = ['iln3iamp', 'betan', 'fs04', 'density']
+
+# Retrieve labeled data from OMFIT database
+table_data = OMFIT['my_labels']['data']
+
+# Find indices where the shot number matches the target shot
+ishot = where(table_data['Shot'] == shot)[0]
+
+'''
+# Optional debug prints to show start/end times and labels for the shot
+print(table_data['t_start'][ishot])
+print(table_data['t_end'][ishot])
+print(table_data['Label'][ishot])
+'''
+
+# Extract the start and end time of the first label entry for the shot
+t_start = float(table_data['t_start'][ishot][0])
+labels = table_data['Label'][ishot]
+
+
+"""
+Rounds a number up to the nearest even multiple of 10.
+If the rounded result ends in an odd tens digit, add another 10 to make it even.
+"""
+def round_up_to_even_tens(number):
+    rounded = ((number + 9) // 10) * 10
+    if (rounded // 10) % 2 != 0:  # If tens digit is odd
+        rounded += 10
+    return rounded
+
+
+"""
+Calculates the percentage similarity between two binary arrays.
+
+Parameters:
+arr1, arr2 : list or array-like
+    input binary arrays to compare.
+
+Returns:
+float - Percentage of matching elements.
+"""
+
+def calculate_similarity(arr1, arr2):
+    arr1, arr2 = np.array(arr1), np.array(arr2)
+    matches = np.sum(arr1 == arr2)
+    similarity = (matches / len(arr1)) * 100
+    return similarity
+
+# Round the start time up to the next even tens digit (ex. 20/40/60..)
+rounded_start = round_up_to_even_tens(t_start)
+
+# Initialize arrays to hold binary classification of suppression state
+my_array = []
+wang_array = []
+
+current_time = rounded_start
+
+# Generate custom suppression label array from label data
+for ilbl in range(len(ishot)):
+    # Extract label time range for each entry
+    t_start_lbl = float(table_data['t_start'][ishot][ilbl])
+    t_end_lbl = float(table_data['t_end'][ishot][ilbl])
+
+    # Check if current_time falls within this label’s range
+    while t_start_lbl <= current_time <= t_end_lbl:
+        label = table_data['Label'][ishot][ilbl]
+        # Encode 'Suppressed' and 'Dithering' as 1, others as 0
+        if label == 'Suppressed' or label == 'Dithering':
+            my_array.append(1)
+        else:
+            my_array.append(0)
+        current_time += 20  # Move to next time step
+
+#print(my_array)
+
+# Get corresponding data from Wang's suppression dataset
+wshot = where(OMFIT['wang_data']['shot'] == shot)[0]
+
+wang_array = []
+# Calculate offset in time array for proper alignment with rounded_start
+offset = where(OMFIT['wang_data']['time'][wshot] == rounded_start)[0]
+
+# Build suppression label array from Wang's data
+for i in range(len(my_array)):
+    suppression_state = OMFIT['wang_data']['suppressed'][wshot][i+offset]
+    if suppression_state == True:
+        wang_array.append(1)
+    else:
+        wang_array.append(0)
+
+#print(wang_array)
+
+# Compare both suppression arrays and compute similarity percentage
+similarity_percentage = calculate_similarity(my_array, wang_array)
+print(similarity_percentage)
